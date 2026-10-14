@@ -3336,6 +3336,161 @@ describe("ScheduleService", () => {
     expect((await service.inspect(created.id)).status).toBe("active");
   });
 
+  test("keeps the schedule active when the agent is unarchived before an archived run is recorded", async () => {
+    const agentId = "13131313-1313-4131-8131-131313131313";
+    await agentStorage.upsert(
+      buildAgentRecord({
+        id: agentId,
+        cwd: tempDir,
+        iso: now.toISOString(),
+        archivedAt: "2026-01-01T00:00:30.000Z",
+      }),
+    );
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => {
+        // The run saw the archived record; the agent is unarchived (and its
+        // resume finds nothing paused yet) before the failure is recorded.
+        await agentStorage.upsert(
+          buildAgentRecord({ id: agentId, cwd: tempDir, iso: now.toISOString() }),
+        );
+        expect(await service.resumeForUnarchivedAgent(agentId)).toBe(0);
+        throw new ScheduleTargetArchivedError(`Agent ${agentId} is archived`);
+      },
+    });
+
+    const created = await service.create({
+      prompt: "ping restored target",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "agent", agentId },
+    });
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    await service.tick();
+
+    const inspected = await service.inspect(created.id);
+    expect(inspected.status).toBe("active");
+    expect(inspected.pauseReason ?? null).toBeNull();
+    expect(inspected.nextRunAt).toBe("2026-01-01T00:02:00.000Z");
+    expect(inspected.runs[0]?.status).toBe("failed");
+  });
+
+  test("resumes a schedule paused by an archived run while the agent was being unarchived", async () => {
+    const agentId = "14141414-1414-4141-8141-141414141414";
+    await agentStorage.upsert(
+      buildAgentRecord({
+        id: agentId,
+        cwd: tempDir,
+        iso: now.toISOString(),
+        archivedAt: "2026-01-01T00:00:30.000Z",
+      }),
+    );
+    // Hold the failed run's update right after it read the still-archived record.
+    let holdNextRead = false;
+    let markHeld!: () => void;
+    const held = new Promise<void>((resolve) => {
+      markHeld = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const readRecord = agentStorage.get.bind(agentStorage);
+    vi.spyOn(agentStorage, "get").mockImplementation(async (id) => {
+      const record = await readRecord(id);
+      if (holdNextRead && id === agentId) {
+        holdNextRead = false;
+        markHeld();
+        await released;
+      }
+      return record;
+    });
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => {
+        holdNextRead = true;
+        throw new ScheduleTargetArchivedError(`Agent ${agentId} is archived`);
+      },
+    });
+
+    const created = await service.create({
+      prompt: "ping target being restored",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "agent", agentId },
+    });
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    const ticking = service.tick();
+    await held;
+    await agentStorage.upsert(
+      buildAgentRecord({ id: agentId, cwd: tempDir, iso: now.toISOString() }),
+    );
+    // The resume lists the schedule while it is still active, then has to wait
+    // behind the pause being written.
+    const updates = vi.spyOn(ScheduleStore.prototype, "update");
+    try {
+      const resuming = service.resumeForUnarchivedAgent(agentId);
+      await vi.waitFor(() => expect(updates).toHaveBeenCalledWith(created.id, expect.anything()));
+      release();
+      await ticking;
+      expect(await resuming).toBe(1);
+    } finally {
+      updates.mockRestore();
+    }
+
+    const inspected = await service.inspect(created.id);
+    expect(inspected.status).toBe("active");
+    expect(inspected.pauseReason ?? null).toBeNull();
+    expect(inspected.runs[0]?.status).toBe("failed");
+  });
+
+  test("completes the schedule when a run against an archived agent uses up maxRuns", async () => {
+    const archivedAgentId = "15151515-1515-4151-8151-151515151515";
+    await agentStorage.upsert(
+      buildAgentRecord({
+        id: archivedAgentId,
+        cwd: tempDir,
+        iso: now.toISOString(),
+        archivedAt: "2026-01-01T00:00:30.000Z",
+      }),
+    );
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+    });
+
+    const created = await service.create({
+      prompt: "ping archived target once",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "agent", agentId: archivedAgentId },
+      maxRuns: 1,
+    });
+
+    now = new Date("2026-01-01T00:01:00.000Z");
+    await service.tick();
+
+    const inspected = await service.inspect(created.id);
+    expect(inspected.status).toBe("completed");
+    expect(inspected.pauseReason ?? null).toBeNull();
+    expect(inspected.runs[0]?.status).toBe("failed");
+    expect(inspected.runs[0]?.error).toContain("is archived");
+    expect(await service.resumeForUnarchivedAgent(archivedAgentId)).toBe(0);
+  });
+
   test("completes the schedule when a scheduled run targets a missing agent", async () => {
     const service = createScheduleService({
       paseoHome: tempDir,

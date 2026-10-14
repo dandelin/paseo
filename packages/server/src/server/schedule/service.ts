@@ -534,36 +534,37 @@ export class ScheduleService {
   // instead of completing them. unarchive resumes only these, not the ones the
   // user paused.
   async pauseForArchivedAgent(agentId: string): Promise<number> {
-    return this.updateForAgent(
+    return this.updateForAgent({
       agentId,
-      (schedule) => schedule.status === "active",
-      pauseScheduleForArchivedAgent,
-      "Failed to pause schedule for archived agent; continuing",
-    );
+      applies: (schedule) => schedule.status === "active",
+      change: pauseScheduleForArchivedAgent,
+      failureMessage: "Failed to pause schedule for archived agent; continuing",
+    });
   }
 
   async resumeForUnarchivedAgent(agentId: string): Promise<number> {
-    return this.updateForAgent(
+    return this.updateForAgent({
       agentId,
-      isPausedForArchivedAgent,
-      resumeSchedule,
-      "Failed to resume schedule for unarchived agent; continuing",
-    );
+      applies: isPausedForArchivedAgent,
+      change: resumeSchedule,
+      failureMessage: "Failed to resume schedule for unarchived agent; continuing",
+    });
   }
 
-  private async updateForAgent(
-    agentId: string,
-    applies: (schedule: StoredSchedule) => boolean,
-    change: (schedule: StoredSchedule, now: Date) => StoredSchedule,
-    failureMessage: string,
-  ): Promise<number> {
+  private async updateForAgent(params: {
+    agentId: string;
+    applies: (schedule: StoredSchedule) => boolean;
+    change: (schedule: StoredSchedule, now: Date) => StoredSchedule;
+    failureMessage: string;
+  }): Promise<number> {
+    const { agentId, applies, change, failureMessage } = params;
     const now = this.now();
     const schedules = await this.store.list();
+    // Match on the target only and check `applies` inside the update: a run
+    // finishing at the same time can still change the status before the
+    // serialized update gets its turn.
     const matches = schedules.filter(
-      (schedule) =>
-        schedule.target.type === "agent" &&
-        schedule.target.agentId === agentId &&
-        applies(schedule),
+      (schedule) => schedule.target.type === "agent" && schedule.target.agentId === agentId,
     );
     const results = await Promise.allSettled(
       matches.map(async (schedule) => {
@@ -900,7 +901,12 @@ export class ScheduleService {
     targetArchived: boolean;
     manual: boolean;
   }): Promise<void> {
-    const updatedSchedule = await this.store.update(params.scheduleId, (schedule) => {
+    const updatedSchedule = await this.store.update(params.scheduleId, async (schedule) => {
+      // The agent can be unarchived between the failed run reading its record
+      // and this update. Pausing then would outlast the unarchive's resume, so
+      // read the record again and treat the run as an ordinary failure.
+      const targetArchived =
+        params.targetArchived && (await this.isTargetAgentArchived(schedule.target));
       const now = this.now();
       const completedRuns = schedule.runs.map((run) =>
         run.id === params.runId
@@ -925,10 +931,13 @@ export class ScheduleService {
         // The target is permanently gone; retrying only burns the schedule down to
         // its expiry, so complete it now regardless of manual/scheduled origin.
         updated = completeSchedule(updated, now);
-      } else if (params.targetArchived) {
+      } else if (targetArchived) {
         // The target is archived, which can be undone: wait for unarchive instead
-        // of retrying or completing.
-        updated = pauseScheduleForArchivedAgent(updated, now);
+        // of retrying, unless this run already used up the schedule.
+        updated =
+          !params.manual && shouldCompleteSchedule(updated, now)
+            ? completeSchedule(updated, now)
+            : pauseScheduleForArchivedAgent(updated, now);
       } else if (updated.status === "completed") {
         // Completed concurrently; record the run outcome but leave the schedule
         // terminal — don't advance.
@@ -958,6 +967,14 @@ export class ScheduleService {
       return updated;
     });
     requireSchedule(updatedSchedule, params.scheduleId);
+  }
+
+  private async isTargetAgentArchived(target: ScheduleTarget): Promise<boolean> {
+    if (target.type !== "agent") {
+      return false;
+    }
+    const record = await this.agentStorage.get(target.agentId);
+    return Boolean(record?.archivedAt);
   }
 
   private async recordRunWorkspace(params: {

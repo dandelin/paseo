@@ -2329,13 +2329,9 @@ export class AgentManager {
     agentId: string,
     updates?: { workspaceId?: string; labels?: AgentLabelPatch },
   ): Promise<boolean> {
-    const unarchived = await this.runLifecycleMutation(agentId, () =>
+    return this.runLifecycleMutation(agentId, () =>
       this.unarchiveSnapshotUnlocked(agentId, updates),
     );
-    if (unarchived) {
-      await this.fireAgentUnarchived(agentId);
-    }
-    return unarchived;
   }
 
   private async unarchiveSnapshotUnlocked(
@@ -2364,6 +2360,9 @@ export class AgentManager {
     if (this.getAgent(agentId)) {
       this.notifyAgentState(agentId);
     }
+    // Inside the lifecycle lane, like the archive callback, so a following
+    // archive cannot interleave with what the callback does for this unarchive.
+    await this.fireAgentUnarchived(agentId);
     return true;
   }
 
